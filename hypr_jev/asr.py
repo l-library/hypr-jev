@@ -18,11 +18,7 @@ import numpy as np
 
 from .config import ASR_LANGUAGE, ASR_MODEL, ASR_RATE, ASR_TIMEOUT_S
 from .feedback import interact, render
-
-
-def fifo_path() -> str:
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
-    return os.path.join(base, "hypr-jev.ptt")
+from .runtime import ptt_fifo_path as fifo_path
 
 
 class Recorder:

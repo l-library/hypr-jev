@@ -64,9 +64,12 @@ WIDE_MAX = 240
 
 # ASR(faster-whisper,本地 CPU int8)
 # HF 官方源不可达,模型经 hf-mirror 下载到本地目录(README 有说明)
+# 路径可移植:默认按包位置解析(与 cwd/安装方式无关),可用 HYPR_JEV_ASR_MODEL
+# 指向任意本地模型目录(如装到 XDG_DATA_HOME 下的场景)。
 import os as _os
 _ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-ASR_MODEL = _os.path.join(_ROOT, "models", "faster-whisper-small")
+ASR_MODEL = (_os.environ.get("HYPR_JEV_ASR_MODEL")
+             or _os.path.join(_ROOT, "models", "faster-whisper-small"))
 ASR_RATE = 16000
 ASR_LANGUAGE = None     # None = 自动检测(支持中英混说);或 "zh" / "en"
 ASR_TIMEOUT_S = 12.0    # PTT 最长录音时长,超时自动截断

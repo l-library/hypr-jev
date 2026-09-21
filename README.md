@@ -20,6 +20,8 @@
   支持中文泛称("计算器"→Calculator)与昵称("B站"→bilibili)
 - **定向关窗**——枚举打开窗口交给 Jev 语义匹配,按地址精确关闭,绝不误关聚焦窗口
 - **ASR 语音输入**——按住 `Super+F9` 说话,本地 faster-whisper 转写,全程离线
+- **常驻 daemon**——systemd 用户服务托管,预热连接 + 预载 ASR 模型,
+  消除每次调用的冷启动(`--send` 全程 <1s)
 - **端到端 ~1.1s**——ASR 600–800ms + Jev 决策 ~400ms(实测见下)
 - **执行安全**——默认 dry-run;破坏性操作(关窗/锁屏)强制确认;测试自带现场恢复
 
@@ -32,10 +34,10 @@
 │ asr.py  PTT 录音   │   │  ├ router.py   Jev 决策    │   │ (终端 + OSD)  │
 │        (faster-    │   │  │  Choice/Noul/Score 并行 │   │ 未来:GUI/TTS  │
 │         whisper)   │   │  ├ executor.py 门控+执行   │   └──────────────┘
-└───────────────────┘   │  └ choose/confirm 确认通道 │
-                        └───────────────────────────┘
-                                   │
-                    Hyprland (hyprctl / Lua dispatch) / wpctl / gtk-launch
+│ daemon.py 常驻服务 │   │  └ choose/confirm 确认通道 │
+│  socket + PTT FIFO │   └───────────────────────────┘
+│ client.py 轻客户端 │                │
+└───────────────────┘   Hyprland (hyprctl / Lua dispatch) / wpctl / gtk-launch
 ```
 
 - 输入源只调 `Session.handle()`,业务核心输出纯数据 `Outcome`,反馈端只消费渲染——
@@ -85,6 +87,54 @@ done
 .venv/bin/python -m hypr_jev --asr --live
 ```
 
+### 常驻 daemon(推荐,消除冷启动)
+
+单次调用的两笔冷启动开销——Jev 连接 TLS/代理握手 ~4.8s、whisper 模型加载数秒——
+只在 daemon 启动时付一次;之后 `--send` 全程 <1s。
+
+```sh
+# 一键生成并启用 systemd 用户服务(路径在安装时解析,仓库搬家后重跑即可)
+.venv/bin/python -m hypr_jev --install-service --live   # 语音助手通常配 --live
+.venv/bin/python -m hypr_jev --install-service           # 不加 --live 则为 dry-run 单元
+
+# 发命令(终端可交互时,confirm/choose 会追问一次)
+.venv/bin/python -m hypr_jev --send "打开终端"
+.venv/bin/python -m hypr_jev --send "关闭终端" --yes      # 自动代答确认(谨慎)
+echo n | .venv/bin/python -m hypr_jev --pending           # 脚本化应答挂起的确认/选择
+
+# 状态 / 切模式 / 停止
+.venv/bin/python -m hypr_jev --status
+.venv/bin/python -m hypr_jev --send "音量大点" --live      # 顺手切 daemon 到 live
+.venv/bin/python -m hypr_jev --stop
+
+# 卸载服务(保留 ~/.config/hypr-jev/env,内含密钥,自行决定去留)
+.venv/bin/python -m hypr_jev --uninstall-service
+```
+
+daemon 同时监听 `$XDG_RUNTIME_DIR/hypr-jev.sock`(文字请求,单行 JSON 协议)与
+PTT FIFO(与 `--asr` 完全同路径,**键位绑定无需任何改动**);语音触发 confirm/choose
+时先挂起,用 `hypr-jev --pending` 从终端应答(语音确认仍是路线图项)。
+
+<details>
+<summary>手动启动(不用 systemd)</summary>
+
+```sh
+.venv/bin/python -m hypr_jev --daemon --live        # 前台常驻,Ctrl-C 退出
+```
+
+</details>
+
+**systemd 服务的可移植性设计**:单元在安装时从当前 venv/仓库解析出绝对路径
+(`ExecStart`/`WorkingDirectory`),密钥与代理写入 `~/.config/hypr-jev/env`
+(权限 600)经 `EnvironmentFile` 注入,不硬编码任何机器信息;ASR 模型、socket、
+FIFO 路径全部按包位置/XDG 解析,与 cwd 无关。若你的 Hyprland 未用 uwsm/DE 托管,
+在 `hyprland.conf` 加上(已配置则忽略):
+
+```ini
+exec-once = dbus-update-activation-environment --systemd --all
+exec-once = systemctl --user start graphical-session.target
+```
+
 REPL 内:`/live` `/dry` 切换执行模式,`/q` 退出;
 应用/窗口匹配低置信度时列出候选让你选编号(Jev 首选标 ★);
 破坏性命令先 `[y/N]` 确认。
@@ -115,6 +165,16 @@ hyprctl eval 'hl.bind("SUPER+F9", hl.dsp.exec_cmd("echo stop > '"$XDG_RUNTIME_DI
 | `ASR_MODEL`         | `models/faster-whisper-small` | 本地模型目录,可换 medium 提精度                 |
 | `ASR_LANGUAGE`      | `None`                        | 自动检测(中英混说);或 `"zh"` / `"en"`           |
 
+环境变量覆盖(可移植旋钮):
+
+| 变量                     | 作用                                             |
+| ------------------------ | ------------------------------------------------ |
+| `HYPR_JEV_ASR_MODEL`     | 覆盖 ASR 模型目录(默认仓库内 `models/…`)         |
+| `HYPR_JEV_RUNTIME_DIR`   | 覆盖 socket/FIFO 所在目录(默认 `XDG_RUNTIME_DIR`)|
+| `TYPESAFE_API_KEY`       | Jev 决策密钥;systemd 服务从 `~/.config/hypr-jev/env` 读 |
+
+> 代理(`HTTPS_PROXY`/`ALL_PROXY` 等)同样从 env 文件注入服务。
+
 ## 测试与验证
 
 ```sh
@@ -132,6 +192,7 @@ hyprctl eval 'hl.bind("SUPER+F9", hl.dsp.exec_cmd("echo stop > '"$XDG_RUNTIME_DI
 | fan-out(1 问题 vs 3 问题) | 基本持平(网络抖动下有波动,历史多次测量近零差)          |
 | `needs_confirm` 区分度    | 关窗 0.6–0.7 / 锁屏 0.85+ / 常规 <0.06                 |
 | ASR 转写                  | jfk 样本逐字正确,实时率 0.26x(2s 命令 ≈ 600–800ms)     |
+| daemon 冷启动(只付一次)  | 连接 ≈0.9–1.3s + 模型 ≈1.2s;此后 `--send` 全程 <1s     |
 | 端到端                    | 语音→执行 ≈ 1.1s;文字→执行 ≈ 0.5s                      |
 | 集成测试                  | 8/8(通知/工作区/音量/浮动/启动/定向关窗/门控拦截/拒识) |
 
@@ -146,13 +207,15 @@ hyprctl eval 'hl.bind("SUPER+F9", hl.dsp.exec_cmd("echo stop > '"$XDG_RUNTIME_DI
   - `gtk-launch` 直跑会阻塞,须经 `hl.dsp.exec_cmd()` 托管
 - 应用启动:名称无字符串重叠且语义罕见的可能未命中;无 `.desktop` 的
   AppImage 不在索引;"关闭所有XX"暂不支持(一次一个窗口)
-- 确认/选择交互仍需终端输入(y/N 或编号),语音确认为待办
-- 首次 API 冷启动 ~4.8s(TLS+代理握手),常驻进程复用连接后消失
+- 确认/选择交互仍需终端输入(y/N 或编号);daemon 模式下可用
+  `--pending` 从终端应答,语音确认为待办
+- ~~首次 API 冷启动 ~4.8s(TLS+代理握手),常驻进程复用连接后消失~~
+  → 已由常驻 daemon + systemd 用户服务消除(见「使用」)
 
 ## 路线图
 
-- [ ] 语音确认(confirm/choose 用语音回答 yes/no 或编号)
-- [ ] 常驻 daemon + systemd 用户服务,消除冷启动
+- [ ] 语音确认(confirm/choose 用语音回答 yes/no 或编号;当前可先挂起后用 `--pending` 应答)
+- [x] 常驻 daemon + systemd 用户服务,消除冷启动(`--daemon` / `--install-service`)
 - [ ] GUI / TTS 反馈端(替换 `feedback.py`)
 - [ ] VAD 自动断句,免按键
 - [ ] 动作扩展:媒体控制、剪贴板、多窗口批量操作
@@ -164,6 +227,8 @@ Issue / PR 欢迎。改动后请跑:
 ```sh
 .venv/bin/python tests/test_exec.py --dry   # 链路回归(无副作用)
 .venv/bin/python tests/test_intents.py      # 意图基准(真实 API)
+.venv/bin/python tests/test_daemon.py       # daemon 协议回归(离线)
+.venv/bin/python tests/test_service.py      # systemd 安装回归(离线)
 ```
 
 ## 致谢

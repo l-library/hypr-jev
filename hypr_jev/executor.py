@@ -72,8 +72,15 @@ def hyprctl(*args: str) -> tuple[bool, str]:
 
 
 def notify(text: str) -> None:
-    """桌面 OSD 反馈(未来 GUI/TTS 的现状替代)。"""
-    hyprctl("notify", "1", "3000", "0", f"fontsize(14) {text}")
+    """桌面 OSD 反馈(未来 GUI/TTS 的现状替代)。
+
+    常驻 daemon 里由渲染路径调用,任何失败都只降级、不上抛,
+    避免反馈通道(如 hyprctl 短暂不可用)杀死主循环。
+    """
+    try:
+        hyprctl("notify", "1", "3000", "0", f"fontsize(14) {text}")
+    except Exception:
+        pass
 
 
 def _volume_pct(decision) -> int:
