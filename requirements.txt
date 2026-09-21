@@ -1,0 +1,3 @@
+typesafe-sdk
+socksio          # 走 socks5 代理访问 API 时需要
+faster-whisper   # ASR(本地 int8 CPU)

@@ -1,0 +1,173 @@
+# hypr-jev
+
+自然语言 / 语音控制的 Hyprland 桌面助手。
+[TypeSafe Jev](https://docs.typesafe.ai) 做意图决策与置信度门控,
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) 做本地离线语音识别。
+
+```
+"打开计算器"  →  意图路由 + 应用语义匹配  →  gtk-launch  →  ✅
+"音量大一点"  →  意图 + 强度评分(步长)    →  wpctl +15%  →  ✅
+"关闭终端"    →  窗口定向(语义匹配窗口)  →  按地址精确关闭 →  确认后 ✅
+"今天天气怎么样" →  非命令拒识(other)  →  静默忽略,零副作用
+```
+
+## 特性
+
+- **中英混合自然语言**——同一个 intent 表,中英文、口语化、中英混说均可
+- **置信度门控**——高置信度自动执行,中置信度请求确认,低置信度/非命令直接忽略,
+  宁可不执行,绝不误执行
+- **启动任意已安装应用**——本地 `.desktop` 索引检索 + Jev 语义精排两级架构,
+  支持中文泛称("计算器"→Calculator)与昵称("B站"→bilibili)
+- **定向关窗**——枚举打开窗口交给 Jev 语义匹配,按地址精确关闭,绝不误关聚焦窗口
+- **ASR 语音输入**——按住 `Super+F9` 说话,本地 faster-whisper 转写,全程离线
+- **端到端 ~1.1s**——ASR 600–800ms + Jev 决策 ~400ms(实测见下)
+- **执行安全**——默认 dry-run;破坏性操作(关窗/锁屏)强制确认;测试自带现场恢复
+
+## 架构
+
+```
+输入源                      业务核心                             反馈端
+┌───────────────────┐   ┌───────────────────────────┐   ┌──────────────┐
+│ cli.py  文字 REPL  │──▶│ Session.handle(text)       │──▶│ feedback.py   │
+│ asr.py  PTT 录音   │   │  ├ router.py   Jev 决策    │   │ (终端 + OSD)  │
+│        (faster-    │   │  │  Choice/Noul/Score 并行 │   │ 未来:GUI/TTS  │
+│         whisper)   │   │  ├ executor.py 门控+执行   │   └──────────────┘
+└───────────────────┘   │  └ choose/confirm 确认通道 │
+                        └───────────────────────────┘
+                                   │
+                    Hyprland (hyprctl / Lua dispatch) / wpctl / gtk-launch
+```
+
+- 输入源只调 `Session.handle()`,业务核心输出纯数据 `Outcome`,反馈端只消费渲染——
+  接 GUI/TTS 不动核心
+- 一次 Jev 调用并行携带三个问题:`intent`(Choice)、`needs_confirm`(Noul)、
+  `strength`(Score),加问题几乎不加延迟
+
+## 环境要求
+
+- Linux + [Hyprland](https://hyprland.org) **≥ 0.55**(Lua 配置体系)
+- Python ≥ 3.10,`pip` venv
+- [TypeSafe API Key](https://docs.typesafe.ai)(环境变量 `TYPESAFE_API_KEY`)
+- ASR 需要麦克风(`arecord`,经 PipeWire)
+
+## 快速开始
+
+```sh
+git clone <repo> && cd hypr-jev
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+export TYPESAFE_API_KEY=...        # 已导出则跳过
+```
+
+下载 ASR 模型(HF 官方源不可达时走镜像,约 461MB,存于 `models/`):
+
+```sh
+mkdir -p models/faster-whisper-small
+for f in config.json tokenizer.json vocabulary.txt model.bin; do
+  curl -sSL -C - -o models/faster-whisper-small/$f \
+    https://hf-mirror.com/Systran/faster-whisper-small/resolve/main/$f
+done
+```
+
+> 走 socks5 代理访问 TypeSafe API 时需要 `socksio`(已含在 requirements)。
+
+## 使用
+
+```sh
+# 文字 REPL(默认 dry-run,--live 真实执行)
+.venv/bin/python -m hypr_jev
+.venv/bin/python -m hypr_jev --live
+
+# 单句模式(脚本/管道;--yes 自动代答确认)
+.venv/bin/python -m hypr_jev --once "打开终端" --live
+
+# ASR 语音模式(常驻;按住 Super+F9 说话,松开转写执行)
+.venv/bin/python -m hypr_jev --asr --live
+```
+
+REPL 内:`/live` `/dry` 切换执行模式,`/q` 退出;
+应用/窗口匹配低置信度时列出候选让你选编号(Jev 首选标 ★);
+破坏性命令先 `[y/N]` 确认。
+
+### PTT 按键绑定(可选)
+
+ASR 模式监听 FIFO(`$XDG_RUNTIME_DIR/hypr-jev.ptt`)。注册按住说话键:
+
+```sh
+hyprctl eval 'hl.bind("SUPER+F9", hl.dsp.exec_cmd("echo start > '"$XDG_RUNTIME_DIR"'/hypr-jev.ptt"))'
+hyprctl eval 'hl.bind("SUPER+F9", hl.dsp.exec_cmd("echo stop > '"$XDG_RUNTIME_DIR"'/hypr-jev.ptt"), { release = true })'
+```
+
+> 运行时注册,重载配置即失效;永久化把两句 `hl.bind` 写进 Lua 配置即可。
+> 也可任意方式写 FIFO:`echo start > $FIFO; …说话…; echo stop > $FIFO`
+
+## 配置
+
+所有参数集中在 `hypr_jev/config.py`:
+
+| 参数                | 默认                          | 说明                                            |
+| ------------------- | ----------------------------- | ----------------------------------------------- |
+| `CONF_EXECUTE`      | 0.75                          | ≥ 此值且免确认 → 自动执行                       |
+| `CONF_ASK`          | 0.50                          | < 此值 → 忽略(视作没听见)                       |
+| `NEEDS_CONFIRM_MAX` | 0.40                          | Jev 判定破坏性 ≥ 此值 → 强制确认                |
+| `INTENTS`           | —                             | 意图表(option → 英文评分说明),加命令改这里      |
+| `WIDE_MAX`          | 240                           | 应用全量语义回退的目录规模上限(Choice 上限 255) |
+| `ASR_MODEL`         | `models/faster-whisper-small` | 本地模型目录,可换 medium 提精度                 |
+| `ASR_LANGUAGE`      | `None`                        | 自动检测(中英混说);或 `"zh"` / `"en"`           |
+
+## 测试与验证
+
+```sh
+.venv/bin/python tests/test_intents.py   # 意图基准:22 例中英准确率 + 延迟 + fan-out(真实 API)
+.venv/bin/python tests/test_exec.py      # 端到端集成:8 步可逆 live 动作,自动恢复现场
+.venv/bin/python tests/test_exec.py --dry  # 只走链路不执行
+```
+
+实测结果(RT 3050 / i5-11400H,Hyprland 0.56.2,经本地代理):
+
+| 项目                      | 结果                                                   |
+| ------------------------- | ------------------------------------------------------ |
+| 意图识别(22 例中英+混合)  | **22/22 全对**,负例拒识正确                            |
+| Jev 决策延迟              | p50 ≈ 400ms(含代理往返);直连热调用 291–402ms           |
+| fan-out(1 问题 vs 3 问题) | 基本持平(网络抖动下有波动,历史多次测量近零差)          |
+| `needs_confirm` 区分度    | 关窗 0.6–0.7 / 锁屏 0.85+ / 常规 <0.06                 |
+| ASR 转写                  | jfk 样本逐字正确,实时率 0.26x(2s 命令 ≈ 600–800ms)     |
+| 端到端                    | 语音→执行 ≈ 1.1s;文字→执行 ≈ 0.5s                      |
+| 集成测试                  | 8/8(通知/工作区/音量/浮动/启动/定向关窗/门控拦截/拒识) |
+
+## 已知限制
+
+- **Hyprland ≥0.55 的 Lua IPC 是主要坑源**(均已在本项目解决并记录):
+  - `hyprctl dispatch` 旧字符串语法废弃,须用 `hl.dsp.*` Lua 表达式;
+  - `clients` JSON 不再含 `focused` 字段,需从 `activewindow` 取;
+  - 窗口关闭只有 `close({ window = "address:0x…" })` 精确有效,
+    位置参数形式在目标非聚焦时静默失效/误关聚焦窗口;
+  - `hyprctl keyword` 在 Lua 配置下不可用(键位须 `hl.bind` via eval);
+  - `gtk-launch` 直跑会阻塞,须经 `hl.dsp.exec_cmd()` 托管
+- 应用启动:名称无字符串重叠且语义罕见的可能未命中;无 `.desktop` 的
+  AppImage 不在索引;"关闭所有XX"暂不支持(一次一个窗口)
+- 确认/选择交互仍需终端输入(y/N 或编号),语音确认为待办
+- 首次 API 冷启动 ~4.8s(TLS+代理握手),常驻进程复用连接后消失
+
+## 路线图
+
+- [ ] 语音确认(confirm/choose 用语音回答 yes/no 或编号)
+- [ ] 常驻 daemon + systemd 用户服务,消除冷启动
+- [ ] GUI / TTS 反馈端(替换 `feedback.py`)
+- [ ] VAD 自动断句,免按键
+- [ ] 动作扩展:媒体控制、剪贴板、多窗口批量操作
+
+## 贡献
+
+Issue / PR 欢迎。改动后请跑:
+
+```sh
+.venv/bin/python tests/test_exec.py --dry   # 链路回归(无副作用)
+.venv/bin/python tests/test_intents.py      # 意图基准(真实 API)
+```
+
+## 致谢
+
+- [TypeSafe](https://typesafe.ai) — Jev / System One 决策模型
+- [SYSTRAN](https://github.com/SYSTRAN) — faster-whisper
+- [Hyprland](https://hyprland.org)
