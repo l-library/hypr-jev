@@ -5,7 +5,8 @@
 
 对外入口(路径见 runtime.py):
   - Unix socket:文本请求(单行 JSON → 单行 JSON)
-  - PTT FIFO:语音按住说话,令牌协议与 --asr 模式完全一致
+  - PTT FIFO:语音按住说话,令牌协议与 --asr 模式完全一致;
+    confirm/choose 挂起后,下一句语音若整句恰好是「是/否/编号」则直接作为应答
 
 socket 协议:
   {"cmd":"handle","text":"…","yes":false}   处理一句;confirm/choose 未应答时挂起
@@ -26,6 +27,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -47,6 +49,69 @@ def _capture(fn, *args) -> str:
     with contextlib.redirect_stdout(buf):
         fn(*args)
     return buf.getvalue()
+
+
+# ---- 语音应答解析(纯函数,离线可测)----
+
+_YES = {
+    "y", "yes", "yeah", "yep", "ok", "okay", "sure", "confirm",
+    "是", "是的", "是呀", "是啊", "对", "对的", "对呀", "对啊",
+    "好", "好的", "好吧", "好呀", "好啊", "好嘞", "确认", "确定", "确认执行", "没问题",
+    "可以", "行", "行的", "行吧", "行呀", "行啊", "执行", "执行吧", "就这么办",
+}
+_NO = {
+    "n", "no", "nope", "cancel",
+    "不", "不吧", "不要", "不要了", "不好", "不行", "不行的", "不用", "不用了",
+    "不必", "别", "别吧", "别执行", "先别", "先不要", "算了", "算了吧",
+    "取消", "取消吧", "否", "不执行",
+}
+_CN_NUM = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+           "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_NUM = r"([0-9]+|[零〇一二两三四五六七八九十]+)"
+
+
+def _num(s: str) -> int | None:
+    """阿拉伯或中文数字串(0–99)→ int;无法解析返回 None。"""
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        tens, _, ones = s.partition("十")
+        if (tens and tens not in _CN_NUM) or (ones and ones not in _CN_NUM):
+            return None
+        return ((_CN_NUM[tens] if tens else 1) * 10
+                + (_CN_NUM[ones] if ones else 0))
+    return _CN_NUM.get(s)
+
+
+def parse_answer(text: str) -> str | int | None:
+    """把一句转写解析为挂起 confirm/choose 的应答。
+
+    返回 "yes" / "no" / 0 基编号(int)/ None(不是应答,按普通命令处理)。
+    只有整句恰好是应答才命中——包含式匹配在语音场景太容易误执行。
+
+    编号规则:带「第」是第几个(1 基,「第一个」→ 0);不带「第」
+    (裸数字 /「N号」/「选N」)是屏幕上印出的编号(0 基)。
+    """
+    norm = re.sub(r"[\s，。、.,!！?？~～·]+", "", text).lower()
+    if not norm:
+        return None
+    if norm in _YES:
+        return "yes"
+    if norm in _NO:
+        return "no"
+    m = re.fullmatch(rf"(?:选择|选)?第{_NUM}[个号项]?", norm)   # 第N个:1 基序数
+    if m:
+        n = _num(m.group(1))
+        return n - 1 if n and n > 0 else None
+    m = re.fullmatch(rf"(?:选择|选)?([0-9]+)(?:个|号|项|选项|号选项)?", norm)
+    if m:                                                      # 屏显编号(数字)
+        return int(m.group(1))
+    m = re.fullmatch(
+        rf"(?:选择|选)([零〇一二两三四五六七八九十]+)(?:个|号|项|选项|号选项)?"
+        rf"|([零〇一二两三四五六七八九十]+)(?:号|项|选项|号选项)", norm)
+    if m:                                                      # 屏显编号(中文数字)
+        return _num(m.group(1) or m.group(2))
+    return None
 
 
 class Daemon:
@@ -112,6 +177,8 @@ class Daemon:
                             recorder.start()
                             rec_started = now
                             print("  ● 录音中…")
+                            if self.pending:
+                                print("  ⏸ 有挂起待确认:可说「是 / 否 / 编号」")
                         elif token == "stop" and recorder.proc:
                             self._finish_voice(recorder.stop())
                             rec_started = None
@@ -274,6 +341,35 @@ class Daemon:
                 "uptime_s": round(time.time() - self.started, 1),
                 "pid": os.getpid()}
 
+    # ---- 语音应答:挂起的 confirm/choose 用下一句语音回答 ----
+
+    def _voice_answer(self, text: str) -> bool:
+        """挂起存在时,尝试把这句转写当作语音应答;命中并处理返回 True。"""
+        p = self.pending
+        if p is None:
+            return False
+        ans = parse_answer(text)
+        if ans is None:
+            return False
+        if p["type"] == "confirm":
+            if not isinstance(ans, str):
+                return False   # confirm 不吃编号,整句按普通命令处理
+            value = "y" if ans == "yes" else "n"
+        else:   # choose:「好」= 选 Jev 首选(与 --yes 代答一致),「否」取消
+            choices = p["action"].choices or []
+            if ans == "yes":
+                idx = next((i for i, (cid, _l, _c) in enumerate(choices)
+                            if cid == p["action"].pick_id), 0)
+                value = str(idx)
+            elif ans == "no":
+                value = "n"
+            else:
+                value = str(ans)
+        print(f"  🗣 语音应答 {text!r}")
+        resp = self._cmd_answer({"cmd": "answer", "value": value})
+        print(resp.get("output", ""), end="")
+        return True
+
     # ---- Outcome 结算:渲染 + 挂起记录 + auto_yes 代答 ----
 
     def _settle(self, outcome, auto_yes: bool):
@@ -326,11 +422,13 @@ class Daemon:
             print(f"  🎙 {text!r}  (ASR {ms:.0f}ms / 录音 {audio.size / ASR_RATE:.1f}s)")
             if not text:
                 return
+            if self._voice_answer(text):
+                return
             outcome = self.session.handle(text)
             out, _o, pending = self._settle(outcome, self.auto_yes)
             print(out, end="")
             if pending:
-                # 语音确认未实现(路线图);挂起先记录,可从终端 --pending 应答
-                print("  ⏸ 挂起待确认:可用 `python -m hypr_jev --pending` 应答")
+                print("  ⏸ 挂起待确认:再说一句「是 / 否 / 编号」即可语音应答," 
+                      "或用 `python -m hypr_jev --pending` 从终端应答")
         except Exception as e:
             print(f"  ✖ 语音处理失败: {type(e).__name__}: {e}")

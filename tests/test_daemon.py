@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["HYPR_JEV_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="hypr-jev-test-")
 
 from hypr_jev.client import DaemonUnavailable, request  # noqa: E402
-from hypr_jev.daemon import Daemon  # noqa: E402
+from hypr_jev.daemon import Daemon, parse_answer  # noqa: E402
 from hypr_jev.executor import Action  # noqa: E402
 from hypr_jev.runtime import socket_path  # noqa: E402
 from hypr_jev.session import Outcome  # noqa: E402
@@ -164,14 +164,57 @@ def main() -> int:
         expect(request({"cmd": "pending"})["pending"] is None,
                "TTL 过期后挂起被自动回收")
 
-        # 12. 双开保护
+        # 12. 语音应答解析(纯函数):yes / no / 编号 / 非应答
+        yes_no = [("是的", "yes"), ("好的", "yes"), ("确认执行", "yes"),
+                  ("OK", "yes"), ("Yes.", "yes"), ("行吧", "yes"),
+                  ("取消", "no"), ("算了", "no"), ("不要", "no"), ("先不要", "no")]
+        expect(all(parse_answer(t) == w for t, w in yes_no), "yes/no 语音应答全命中")
+        idx = [("第一个", 0), ("第2个", 1), ("选择第三个", 2), ("第十个", 9),
+               ("2", 2), ("0", 0), ("2号", 2), ("选2", 2), ("选三", 3)]
+        expect(all(parse_answer(t) == w for t, w in idx), "编号语音应答全命中")
+        noans = ["打开终端", "关闭终端", "音量大一点", "十一", "三个", "", "继续"]
+        expect(all(parse_answer(t) is None for t in noans),
+               "普通命令/噪声不会被当成应答")
+
+        # 13. 语音确认流程:挂起后 _voice_answer 命中/不命中
+        request({"cmd": "handle", "text": "CONFIRM"})
+        expect(not daemon._voice_answer("打开计算器") and daemon.pending is not None,
+               "非应答语音返回 False,保持挂起走正常处理")
+        expect(daemon._voice_answer("好的") and session.executed[-1] == "危险操作",
+               "语音「好的」确认并执行")
+        expect(daemon.pending is None, "语音应答后挂起清除")
+
+        n_exec = len(session.executed)
+        request({"cmd": "handle", "text": "CONFIRM"})
+        expect(daemon._voice_answer("算了") and len(session.executed) == n_exec
+               and not daemon.pending, "语音「算了」取消,不执行")
+
+        request({"cmd": "handle", "text": "CONFIRM"})
+        expect(not daemon._voice_answer("第一个") and daemon.pending is not None,
+               "confirm 不把编号当应答,保持挂起")
+        daemon.pending = None   # 清理后继续
+
+        request({"cmd": "handle", "text": "CHOOSE"})
+        expect(daemon._voice_answer("第一个") and session.chosen == [1, 0],
+               "语音「第一个」选中 0 号候选")
+        request({"cmd": "handle", "text": "CHOOSE"})
+        expect(daemon._voice_answer("第二个") and session.chosen == [1, 0, 1],
+               "语音「第二个」选中 1 号候选")
+        request({"cmd": "handle", "text": "CHOOSE"})
+        expect(daemon._voice_answer("好的") and session.chosen == [1, 0, 1, 1],
+               "choose 挂起时「好的」= 选 Jev 首选")
+        request({"cmd": "handle", "text": "CHOOSE"})
+        expect(daemon._voice_answer("取消") and not daemon.pending
+               and session.chosen == [1, 0, 1, 1], "choose 语音取消,未选择")
+
+        # 14. 双开保护
         try:
             Daemon(FakeSession(), preload_asr=False)._open_socket(socket_path())
             raise AssertionError("双开未被拒绝")
         except SystemExit:
             expect(True, "已有活 daemon 时拒绝二次启动")
 
-        # 13. quit 清理
+        # 15. quit 清理
         r = request({"cmd": "quit"})
         expect(r["ok"], "quit 命令被接受")
         thread.join(timeout=5)

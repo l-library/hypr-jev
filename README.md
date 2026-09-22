@@ -23,6 +23,7 @@
   支持中文泛称("计算器"→Calculator)与昵称("B站"→bilibili)
 - **定向关窗**——枚举打开窗口交给 Jev 语义匹配,按地址精确关闭,绝不误关聚焦窗口
 - **ASR 语音输入**——按住 `Super+F9` 说话,本地 faster-whisper 转写,全程离线
+- **语音确认**——破坏性操作/低置信选择挂起后,直接说「是 / 否 / 编号」应答,免键盘
 - **常驻 daemon**——systemd 用户服务托管,预热连接 + 预载 ASR 模型,
   消除每次调用的冷启动(`--send` 全程 <1s)
 - **端到端 ~1.1s**——ASR 600–800ms + Jev 决策 ~400ms(实测见下)
@@ -151,7 +152,10 @@ echo n | .venv/bin/python -m hypr_jev --pending           # 脚本化应答挂�
 
 daemon 同时监听 `$XDG_RUNTIME_DIR/hypr-jev.sock`(文字请求,单行 JSON 协议)与
 PTT FIFO(与 `--asr` 完全同路径,**键位绑定无需任何改动**);语音触发 confirm/choose
-时先挂起,用 `hypr-jev --pending` 从终端应答(语音确认仍是路线图项)。
+时先挂起,再说一句「是 / 否 / 编号」即可语音应答(只有整句恰好是应答才命中,
+不会误吞普通命令;choose 挂起时说「好」= 选 Jev 首选)。编号规则:带「第」按
+第几个(「第一个」→ 列表 0 号);不带「第」按屏幕印出的编号(「2」/「2号」/「选2」
+→ 2 号)。也可照旧用 `hypr-jev --pending` 从终端应答。
 
 <details>
 <summary>手动启动(不用 systemd)</summary>
@@ -245,14 +249,14 @@ hyprctl eval 'hl.bind("SUPER+F9", hl.dsp.exec_cmd("echo stop > '"$XDG_RUNTIME_DI
   - `gtk-launch` 直跑会阻塞,须经 `hl.dsp.exec_cmd()` 托管
 - 应用启动:名称无字符串重叠且语义罕见的可能未命中;无 `.desktop` 的
   AppImage 不在索引;"关闭所有XX"暂不支持(一次一个窗口)
-- 确认/选择交互仍需终端输入(y/N 或编号);daemon 模式下可用
-  `--pending` 从终端应答,语音确认为待办
+- REPL / `--asr` 模式的确认/选择仍是终端输入(y/N 或编号);daemon 语音路径
+  支持语音应答(是/否/编号),终端侧可用 `--pending` 应答
 - ~~首次 API 冷启动 ~4.8s(TLS+代理握手),常驻进程复用连接后消失~~
   → 已由常驻 daemon + systemd 用户服务消除(见「使用」)
 
 ## 路线图
 
-- [ ] 语音确认(confirm/choose 用语音回答 yes/no 或编号;当前可先挂起后用 `--pending` 应答)
+- [x] 语音确认(confirm/choose 挂起后用语音回答 yes/no 或编号;终端侧仍可用 `--pending` 应答)
 - [x] 常驻 daemon + systemd 用户服务,消除冷启动(`--daemon` / `--install-service`)
 - [ ] GUI / TTS 反馈端(替换 `feedback.py`)
 - [ ] VAD 自动断句,免按键
